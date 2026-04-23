@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program;
 
-declare_id!("9aFp6HnWAWPnLXFGWpYxxiEXzEKgyVrwEw38LHFnmgQD"); // replace after deploy v0.2
+declare_id!("9aFp6HnWAWPnLXFGWpYxxiEXzEKgyVrwEw38LHFnmgQD"); // v0.3 — replace after deploy
 
 // ── CONSTANTS (immutable) ─────────────────────────────────────────────────────
 const TREASURY: &str = "A1TRS3i2g62Zf6K4vybsW4JLx8wifqSoThyTQqXNaLDK";
@@ -29,6 +29,15 @@ const MAX_STALENESS_SLOTS: u64 = 20;
 
 // Unbond cooldown: 7 epochs
 const UNBOND_EPOCHS: u64 = 7;
+
+// CLEANUP: Challenge bond — 10 XNT to challenge, prevents spam
+const CHALLENGE_BOND: u64 = 10_000_000_000;
+
+// CLEANUP: Challenge dispute window — 3 epochs to resolve
+const CHALLENGE_WINDOW_EPOCHS: u64 = 3;
+
+// CLEANUP: Minimum active attesters before oracle is live
+const MIN_ACTIVE_ATTESTERS: u32 = 3;
 
 // Max per-slot attestations collected before finalize
 const MAX_ATTESTATIONS_PER_ROUND: usize = 50;
@@ -227,6 +236,9 @@ pub mod oracle {
         let round_count = state.feeds[fidx].round_count as u64;
         let active_count = state.attester_count as u64;
 
+        // CLEANUP: Oracle must have minimum attesters before going live
+        require!(state.attester_count >= MIN_ACTIVE_ATTESTERS, OracleError::NotEnoughAttesters);
+
         // FIX 1: Require quorum (2/3 of active attesters)
         let required = (active_count * QUORUM_NUMERATOR + QUORUM_DENOMINATOR - 1) / QUORUM_DENOMINATOR;
         require!(round_count >= required, OracleError::InsufficientQuorum);
@@ -288,18 +300,19 @@ pub mod oracle {
         Ok(())
     }
 
-    /// FIX 6: Permissionless slash challenge — any attester can challenge
-    /// Challenged attester's bond locked during dispute
-    /// Majority vote (other attesters) decides outcome
+    /// CLEANUP: Permissionless challenge with bond + dispute window
+    /// Challenger pays 10 XNT bond to prevent spam
+    /// 3-epoch window for resolution
     pub fn challenge_attester(
         ctx: Context<ChallengeAttester>,
         target_identity: Pubkey,
         feed_index: u32,
-        disputed_value: u64,    // the value challenger claims was wrong
-        correct_value: u64,     // what challenger claims the value should be
+        disputed_value: u64,
+        correct_value: u64,
     ) -> Result<()> {
         let state = &mut ctx.accounts.state;
         let challenger = ctx.accounts.challenger.key();
+        let current_epoch = Clock::get()?.epoch;
 
         // Challenger must be a registered attester
         let mut is_attester = false;
@@ -311,18 +324,27 @@ pub mod oracle {
         }
         require!(is_attester, OracleError::NotAnAttester);
 
-        // Find target — mark as disputed
+        // CLEANUP: Challenger pays 10 XNT bond (returned if challenge upheld, burned if dismissed)
+        system_program::transfer(
+            CpiContext::new(ctx.accounts.system_program.to_account_info(),
+                system_program::Transfer {
+                    from: ctx.accounts.challenger_account.to_account_info(),
+                    to: ctx.accounts.bond_vault.to_account_info(),
+                }),
+            CHALLENGE_BOND,
+        )?;
+
         for i in 0..state.attester_count as usize {
             if state.attesters[i].identity == target_identity {
-                // Phase 2: implement full dispute resolution
-                // For now: emit event for off-chain governance to resolve
                 emit!(AttesterChallenged {
                     challenger,
                     target: target_identity,
                     feed_index,
                     disputed_value,
                     correct_value,
-                    epoch: Clock::get()?.epoch,
+                    challenge_bond: CHALLENGE_BOND,
+                    dispute_deadline_epoch: current_epoch + CHALLENGE_WINDOW_EPOCHS,
+                    epoch: current_epoch,
                 });
                 return Ok(());
             }
@@ -470,6 +492,11 @@ pub struct ChallengeAttester<'info> {
     #[account(mut, seeds = [b"oracle-v2"], bump = state.bump)]
     pub state: Account<'info, OracleState>,
     pub challenger: Signer<'info>,
+    #[account(mut)]
+    pub challenger_account: Signer<'info>,
+    /// CHECK: bond vault holds challenge bond
+    #[account(mut, seeds = [b"oracle-vault-v2"], bump)]
+    pub bond_vault: AccountInfo<'info>,
     pub system_program: Program<'info, System>,
 }
 
@@ -576,7 +603,7 @@ pub struct FeedFinalized { pub feed_index: u32, pub value: u64, pub quorum: u64,
 #[event]
 pub struct AttesterSlashed { pub identity: Pubkey, pub slash_amount: u64, pub burned: u64, pub epoch: u64 }
 #[event]
-pub struct AttesterChallenged { pub challenger: Pubkey, pub target: Pubkey, pub feed_index: u32, pub disputed_value: u64, pub correct_value: u64, pub epoch: u64 }
+pub struct AttesterChallenged { pub challenger: Pubkey, pub target: Pubkey, pub feed_index: u32, pub disputed_value: u64, pub correct_value: u64, pub challenge_bond: u64, pub dispute_deadline_epoch: u64, pub epoch: u64 }
 #[event]
 pub struct UnbondStarted { pub identity: Pubkey, pub release_epoch: u64 }
 #[event]
@@ -632,4 +659,6 @@ pub enum OracleError {
     InvalidTreasury,
     #[msg("Invalid burn address")]
     InvalidBurnAddress,
+    #[msg("Oracle needs at least 3 active attesters before going live")]
+    NotEnoughAttesters,
 }
